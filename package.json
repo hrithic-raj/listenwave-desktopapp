@@ -1,0 +1,80 @@
+{
+  "name": "listenwave",
+  "version": "1.0.0",
+  "description": "Listen together over local WiFi",
+  "main": "electron/main.js",
+  "scripts": {
+    "start": "concurrently \"npm run react-start\" \"wait-on http://localhost:3000 && electron .\"",
+    "react-start": "react-scripts start",
+    "react-build": "react-scripts build",
+    "build": "npm run react-build && electron-builder",
+    "build:mac": "npm run react-build && electron-builder --mac",
+    "build:win": "npm run react-build && electron-builder --win",
+    "build:linux": "npm run react-build && electron-builder --linux",
+    "dev": "concurrently \"npm run react-start\" \"wait-on http://localhost:3000 && electron .\""
+  },
+  "build": {
+    "appId": "com.listenwave.app",
+    "productName": "ListenWave",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "build/**/*",
+      "electron/**/*",
+      "node_modules/**/*"
+    ],
+    "mac": {
+      "category": "public.app-category.music",
+      "target": [
+        "dmg",
+        "zip"
+      ]
+    },
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb",
+        "rpm"
+      ],
+      "category": "Audio"
+    }
+  },
+  "dependencies": {
+    "bonjour-service": "^1.1.1",
+    "express": "^4.18.2",
+    "music-metadata": "^7.14.0",
+    "socket.io": "^4.6.1",
+    "socket.io-client": "^4.6.1"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "^5.16.5",
+    "@testing-library/react": "^13.4.0",
+    "@testing-library/user-event": "^13.5.0",
+    "concurrently": "^8.0.1",
+    "electron": "^36.9.5",
+    "electron-builder": "^25.0.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-scripts": "5.0.1",
+    "wait-on": "^7.0.1"
+  },
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
+  }
+}
