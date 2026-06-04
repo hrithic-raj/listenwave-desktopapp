@@ -95,7 +95,6 @@ function startHostServer(roomName, password, hostName) {
   });
 
   io.on('connection', (socket) => {
-    // Join room
     socket.on('join', ({ name, password: pw }) => {
       if (pw !== roomState.password) {
         socket.emit('error', { message: 'Wrong password' });
@@ -122,7 +121,17 @@ function startHostServer(roomName, password, hostName) {
       mainWindow?.webContents.send('members-update', roomState.members);
     });
 
-    // Playback control (from any member)
+    // play-track: play a specific track by index - fixes next/prev sync issues
+    socket.on('play-track', ({ track, index, position }) => {
+      roomState.currentTrack = track;
+      roomState.isPlaying = true;
+      roomState.position = position ?? 0;
+      roomState.positionTimestamp = Date.now();
+      // Broadcast to ALL clients including sender
+      io.to('room').emit('play-track', { track, index, position: roomState.position });
+      mainWindow?.webContents.send('play-track', { track, index, position: roomState.position });
+    });
+
     socket.on('play', ({ track, position }) => {
       if (track) roomState.currentTrack = track;
       roomState.isPlaying = true;
@@ -146,21 +155,11 @@ function startHostServer(roomName, password, hostName) {
       mainWindow?.webContents.send('playback-seek', { position });
     });
 
-    socket.on('next', () => {
-      io.to('room').emit('next');
-      mainWindow?.webContents.send('playback-next');
-    });
-
-    socket.on('prev', () => {
-      io.to('room').emit('prev');
-      mainWindow?.webContents.send('playback-prev');
-    });
-
-    socket.on('queue-update', ({ queue, currentTrack }) => {
+    socket.on('queue-update', ({ queue, currentTrack, currentIndex }) => {
       roomState.queue = queue;
-      if (currentTrack) roomState.currentTrack = currentTrack;
-      io.to('room').emit('queue-update', { queue, currentTrack: roomState.currentTrack });
-      mainWindow?.webContents.send('queue-update', { queue, currentTrack: roomState.currentTrack });
+      if (currentTrack !== undefined) roomState.currentTrack = currentTrack;
+      io.to('room').emit('queue-update', { queue, currentTrack: roomState.currentTrack, currentIndex });
+      mainWindow?.webContents.send('queue-update', { queue, currentTrack: roomState.currentTrack, currentIndex });
     });
 
     socket.on('volume', ({ volume }) => {
@@ -172,7 +171,6 @@ function startHostServer(roomName, password, hostName) {
     console.log(`ListenWave server running on port ${PORT}`);
     mainWindow?.webContents.send('server-started', { port: PORT });
 
-    // Advertise via mDNS
     try {
       const { Bonjour } = require('bonjour-service');
       bonjourInstance = new Bonjour();
@@ -195,6 +193,34 @@ function stopHostServer() {
   if (bonjourService) { try { bonjourService.stop(); } catch(e){} bonjourService = null; }
   if (bonjourInstance) { try { bonjourInstance.destroy(); } catch(e){} bonjourInstance = null; }
   if (hostServer) { try { hostServer.close(); } catch(e){} hostServer = null; }
+}
+
+// ─── AUDIO FILE HELPERS ───────────────────────────────────────────────────────
+
+async function parseAudioFiles(filePaths) {
+  const musicMetadata = require('music-metadata');
+  const tracks = [];
+  for (const filePath of filePaths) {
+    try {
+      const meta = await musicMetadata.parseFile(filePath);
+      tracks.push({
+        path: filePath,
+        title: meta.common.title || path.basename(filePath, path.extname(filePath)),
+        artist: meta.common.artist || 'Unknown Artist',
+        album: meta.common.album || '',
+        duration: meta.format.duration || 0,
+      });
+    } catch {
+      tracks.push({
+        path: filePath,
+        title: path.basename(filePath, path.extname(filePath)),
+        artist: 'Unknown Artist',
+        album: '',
+        duration: 0,
+      });
+    }
+  }
+  return tracks;
 }
 
 // ─── IPC HANDLERS ────────────────────────────────────────────────────────────
@@ -246,30 +272,35 @@ ipcMain.handle('pick-files', async () => {
     filters: [{ name: 'Audio', extensions: ['mp3', 'flac', 'wav', 'ogg', 'm4a', 'aac'] }],
   });
   if (result.canceled) return [];
+  return parseAudioFiles(result.filePaths);
+});
 
-  const musicMetadata = require('music-metadata');
-  const tracks = [];
-  for (const filePath of result.filePaths) {
+ipcMain.handle('pick-folder', async () => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    properties: ['openDirectory'],
+  });
+  if (result.canceled) return [];
+
+  const AUDIO_EXTS = new Set(['.mp3', '.flac', '.wav', '.ogg', '.m4a', '.aac']);
+  const audioFiles = [];
+
+  function scanDir(dir) {
     try {
-      const meta = await musicMetadata.parseFile(filePath);
-      tracks.push({
-        path: filePath,
-        title: meta.common.title || path.basename(filePath, path.extname(filePath)),
-        artist: meta.common.artist || 'Unknown Artist',
-        album: meta.common.album || '',
-        duration: meta.format.duration || 0,
-      });
-    } catch {
-      tracks.push({
-        path: filePath,
-        title: path.basename(filePath, path.extname(filePath)),
-        artist: 'Unknown Artist',
-        album: '',
-        duration: 0,
-      });
-    }
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          scanDir(full);
+        } else if (AUDIO_EXTS.has(path.extname(entry.name).toLowerCase())) {
+          audioFiles.push(full);
+        }
+      }
+    } catch (e) {}
   }
-  return tracks;
+
+  scanDir(result.filePaths[0]);
+  audioFiles.sort();
+  return parseAudioFiles(audioFiles);
 });
 
 ipcMain.handle('get-local-ip', () => {

@@ -9,22 +9,50 @@ function fmt(sec) {
   return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
+// ── Drag-and-drop reorder ──────────────────────────────────────────────────────
+function reorder(list, from, to) {
+  const result = [...list];
+  const [removed] = result.splice(from, 1);
+  result.splice(to, 0, removed);
+  return result;
+}
+
 export default function RoomPage({ user, room, onLeave }) {
   const socketRef = useRef(null);
   const audioRef = useRef(new Audio());
+  const serverUrl = `http://${room.host}:${room.port}`;
+
   const [connected, setConnected] = useState(false);
   const [connError, setConnError] = useState('');
   const [members, setMembers] = useState([]);
+
+  // Queue & playback — keep in refs too so callbacks always see latest values
   const [queue, setQueue] = useState([]);
   const [queueIndex, setQueueIndex] = useState(0);
+  const queueRef = useRef([]);
+  const queueIndexRef = useRef(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [position, setPosition] = useState(0);
   const [duration, setDuration] = useState(0);
   const [volume, setVolume] = useState(0.8);
-  const [showQueue, setShowQueue] = useState(false);
 
-  const currentTrack = queue[queueIndex] || null;
+  const [showQueue, setShowQueue] = useState(true);
+  const [shuffle, setShuffle] = useState(false);
+  const shuffleRef = useRef(false);
+
+  // Drag state
+  const dragFrom = useRef(null);
+  const [dragOver, setDragOver] = useState(null);
+
+  // Loading state for folder scan
+  const [loadingFolder, setLoadingFolder] = useState(false);
+
   const isHost = room.isHost;
+
+  // Keep refs in sync
+  useEffect(() => { queueRef.current = queue; }, [queue]);
+  useEffect(() => { queueIndexRef.current = queueIndex; }, [queueIndex]);
+  useEffect(() => { shuffleRef.current = shuffle; }, [shuffle]);
 
   // ── Audio setup ──────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -32,29 +60,57 @@ export default function RoomPage({ user, room, onLeave }) {
     audio.volume = volume;
 
     const onTimeUpdate = () => setPosition(audio.currentTime);
-    const onDuration = () => setDuration(audio.duration);
-    const onEnded = () => handleNext();
+    const onLoaded = () => setDuration(audio.duration);
+    const onEnded = () => advanceTrack();
 
     audio.addEventListener('timeupdate', onTimeUpdate);
-    audio.addEventListener('loadedmetadata', onDuration);
+    audio.addEventListener('loadedmetadata', onLoaded);
     audio.addEventListener('ended', onEnded);
 
     return () => {
       audio.removeEventListener('timeupdate', onTimeUpdate);
-      audio.removeEventListener('loadedmetadata', onDuration);
+      audio.removeEventListener('loadedmetadata', onLoaded);
       audio.removeEventListener('ended', onEnded);
       audio.pause();
     };
-  }, []);
+  }, []); // eslint-disable-line
 
-  useEffect(() => {
-    audioRef.current.volume = volume;
-  }, [volume]);
+  useEffect(() => { audioRef.current.volume = volume; }, [volume]);
+
+  // ── Core: load and play a track ───────────────────────────────────────────────
+  const loadAndPlay = useCallback((track, pos) => {
+    if (!track) return;
+    const audio = audioRef.current;
+    const url = `${serverUrl}/audio?path=${encodeURIComponent(track.path)}`;
+    if (audio.src !== url) {
+      audio.src = url;
+      audio.load();
+    }
+    audio.currentTime = pos || 0;
+    setDuration(track.duration || 0);
+    audio.play().then(() => setIsPlaying(true)).catch(() => setIsPlaying(false));
+  }, [serverUrl]);
+
+  // ── Advance to next track (auto or manual) ────────────────────────────────────
+  const advanceTrack = useCallback(() => {
+    const q = queueRef.current;
+    if (!q.length) return;
+    let nextIndex;
+    if (shuffleRef.current) {
+      nextIndex = Math.floor(Math.random() * q.length);
+    } else {
+      nextIndex = queueIndexRef.current + 1;
+      if (nextIndex >= q.length) return; // end of queue
+    }
+    const nextTrack = q[nextIndex];
+    setQueueIndex(nextIndex);
+    loadAndPlay(nextTrack, 0);
+    socketRef.current?.emit('play-track', { track: nextTrack, index: nextIndex, position: 0 });
+  }, [loadAndPlay]);
 
   // ── Socket.IO ─────────────────────────────────────────────────────────────────
   useEffect(() => {
-    const url = `http://${room.host}:${room.port}`;
-    const socket = io(url, { transports: ['websocket'] });
+    const socket = io(serverUrl, { transports: ['websocket'] });
     socketRef.current = socket;
 
     socket.on('connect', () => {
@@ -64,27 +120,44 @@ export default function RoomPage({ user, room, onLeave }) {
     });
 
     socket.on('connect_error', () => {
-      setConnError('Cannot connect to room. Check the host is running and you are on the same WiFi.');
+      setConnError('Cannot connect. Check host is running and you are on the same WiFi.');
     });
 
     socket.on('error', ({ message }) => setConnError(message));
 
     socket.on('joined', ({ roomState }) => {
-      if (roomState.queue) setQueue(roomState.queue);
-      if (roomState.currentTrack) {
-        const idx = roomState.queue?.findIndex(t => t.path === roomState.currentTrack?.path);
-        if (idx >= 0) setQueueIndex(idx);
-      }
+      const q = roomState.queue || [];
+      setQueue(q);
+      queueRef.current = q;
       setMembers(roomState.members || []);
+
+      let idx = 0;
+      if (roomState.currentTrack) {
+        const found = q.findIndex(t => t.path === roomState.currentTrack?.path);
+        if (found >= 0) idx = found;
+      }
+      setQueueIndex(idx);
+      queueIndexRef.current = idx;
+
       if (roomState.isPlaying && roomState.currentTrack) {
-        loadAndPlay(roomState.currentTrack, roomState.position, url);
+        const syncPos = roomState.position + (Date.now() - roomState.positionTimestamp) / 1000;
+        loadAndPlay(roomState.currentTrack, syncPos);
       }
     });
 
     socket.on('members', setMembers);
 
+    // play-track: a specific track was selected (next/prev/click) — fixes display bug
+    socket.on('play-track', ({ track, index, position: pos }) => {
+      setQueueIndex(index);
+      queueIndexRef.current = index;
+      loadAndPlay(track, pos || 0);
+      setIsPlaying(true);
+    });
+
     socket.on('play', ({ track, position: pos }) => {
-      loadAndPlay(track, pos, url);
+      if (track) loadAndPlay(track, pos);
+      setIsPlaying(true);
     });
 
     socket.on('pause', ({ position: pos }) => {
@@ -98,76 +171,68 @@ export default function RoomPage({ user, room, onLeave }) {
       setPosition(pos);
     });
 
-    socket.on('next', () => { doNext(); });
-    socket.on('prev', () => { doPrev(); });
-
-    socket.on('queue-update', ({ queue: q, currentTrack }) => {
+    // queue-update: queue reordered, shuffled, or tracks added/removed
+    socket.on('queue-update', ({ queue: q, currentTrack, currentIndex }) => {
       setQueue(q || []);
-      if (currentTrack) {
+      queueRef.current = q || [];
+      if (currentIndex !== undefined) {
+        setQueueIndex(currentIndex);
+        queueIndexRef.current = currentIndex;
+      } else if (currentTrack) {
         const idx = (q || []).findIndex(t => t.path === currentTrack.path);
-        setQueueIndex(idx >= 0 ? idx : 0);
+        if (idx >= 0) { setQueueIndex(idx); queueIndexRef.current = idx; }
       }
     });
 
-    socket.on('volume', ({ volume: v }) => {
-      setVolume(v);
-    });
+    socket.on('volume', ({ volume: v }) => setVolume(v));
 
     return () => { socket.disconnect(); };
-  }, [room]);
+  }, [room, serverUrl, loadAndPlay]); // eslint-disable-line
 
-  // IPC from host server (host machine events)
+  // IPC for host (events coming from other clients relayed through server)
   useEffect(() => {
     if (!isHost) return;
-    window.electron?.onPlaybackPlay(({ track, position: pos }) => {
-      loadAndPlay(track, pos, `http://${room.host}:${room.port}`);
+    window.electron?.onPlayTrack(({ track, index, position: pos }) => {
+      setQueueIndex(index);
+      queueIndexRef.current = index;
+      loadAndPlay(track, pos || 0);
     });
     window.electron?.onPlaybackPause(({ position: pos }) => {
       audioRef.current.pause();
       if (pos !== undefined) audioRef.current.currentTime = pos;
       setIsPlaying(false);
     });
-    window.electron?.onPlaybackNext(() => doNext());
-    window.electron?.onPlaybackPrev(() => doPrev());
+    window.electron?.onQueueUpdate(({ queue: q, currentIndex }) => {
+      setQueue(q || []);
+      queueRef.current = q || [];
+      if (currentIndex !== undefined) { setQueueIndex(currentIndex); queueIndexRef.current = currentIndex; }
+    });
     return () => {
-      ['playback-play','playback-pause','playback-next','playback-prev'].forEach(ch =>
+      ['play-track', 'playback-pause', 'queue-update'].forEach(ch =>
         window.electron?.removeAllListeners(ch));
     };
-  }, [isHost, queueIndex, queue]);
+  }, [isHost, loadAndPlay]);
 
-  const loadAndPlay = (track, pos, serverUrl) => {
-    if (!track) return;
-    const audio = audioRef.current;
-    const url = `${serverUrl}/audio?path=${encodeURIComponent(track.path)}`;
-    if (audio.src !== url) {
-      audio.src = url;
-      audio.load();
-    }
-    audio.currentTime = pos || 0;
-    audio.play().then(() => setIsPlaying(true)).catch(() => setIsPlaying(false));
-    setDuration(track.duration || 0);
-  };
-
-  // ── Controls ──────────────────────────────────────────────────────────────────
+  // ── Broadcast helper ──────────────────────────────────────────────────────────
   const broadcast = useCallback((event, data) => {
     socketRef.current?.emit(event, data);
   }, []);
 
+  // ── Playback controls ─────────────────────────────────────────────────────────
   const handlePlay = () => {
-    if (!currentTrack) return;
+    const track = queueRef.current[queueIndexRef.current];
+    if (!track) return;
     const pos = audioRef.current.currentTime;
-    if (isHost) {
-      loadAndPlay(currentTrack, pos, `http://${room.host}:${room.port}`);
-    }
-    broadcast('play', { track: currentTrack, position: pos });
+    loadAndPlay(track, pos);
+    broadcast('play', { track, position: pos });
     setIsPlaying(true);
   };
 
   const handlePause = () => {
     const pos = audioRef.current.currentTime;
-    broadcast('pause', { position: pos });
     audioRef.current.pause();
     setIsPlaying(false);
+    broadcast('pause', { position: pos });
   };
 
   const handleSeek = (e) => {
@@ -177,45 +242,44 @@ export default function RoomPage({ user, room, onLeave }) {
     broadcast('seek', { position: pos });
   };
 
-  const doNext = () => {
-    setQueueIndex(i => {
-      const next = Math.min(i + 1, queue.length - 1);
-      if (queue[next] && isHost) {
-        setTimeout(() => {
-          loadAndPlay(queue[next], 0, `http://${room.host}:${room.port}`);
-          broadcast('play', { track: queue[next], position: 0 });
-        }, 0);
-      }
-      return next;
-    });
+  const handleNext = () => {
+    const q = queueRef.current;
+    if (!q.length) return;
+    let nextIndex;
+    if (shuffleRef.current) {
+      nextIndex = Math.floor(Math.random() * q.length);
+    } else {
+      nextIndex = Math.min(queueIndexRef.current + 1, q.length - 1);
+      if (nextIndex === queueIndexRef.current) return;
+    }
+    const track = q[nextIndex];
+    setQueueIndex(nextIndex);
+    loadAndPlay(track, 0);
+    broadcast('play-track', { track, index: nextIndex, position: 0 });
   };
 
-  const handleNext = () => { doNext(); broadcast('next'); };
-  const doPrev = () => {
+  const handlePrev = () => {
+    const q = queueRef.current;
+    if (!q.length) return;
     if (audioRef.current.currentTime > 3) {
       audioRef.current.currentTime = 0;
       broadcast('seek', { position: 0 });
       return;
     }
-    setQueueIndex(i => {
-      const prev = Math.max(i - 1, 0);
-      if (queue[prev] && isHost) {
-        setTimeout(() => {
-          loadAndPlay(queue[prev], 0, `http://${room.host}:${room.port}`);
-          broadcast('play', { track: queue[prev], position: 0 });
-        }, 0);
-      }
-      return prev;
-    });
+    const prevIndex = Math.max(queueIndexRef.current - 1, 0);
+    if (prevIndex === queueIndexRef.current) return;
+    const track = q[prevIndex];
+    setQueueIndex(prevIndex);
+    loadAndPlay(track, 0);
+    broadcast('play-track', { track, index: prevIndex, position: 0 });
   };
-  const handlePrev = () => { doPrev(); broadcast('prev'); };
 
   const playTrackAt = (index) => {
-    const track = queue[index];
+    const track = queueRef.current[index];
     if (!track) return;
     setQueueIndex(index);
-    if (isHost) loadAndPlay(track, 0, `http://${room.host}:${room.port}`);
-    broadcast('play', { track, position: 0 });
+    loadAndPlay(track, 0);
+    broadcast('play-track', { track, index, position: 0 });
     setIsPlaying(true);
   };
 
@@ -225,40 +289,125 @@ export default function RoomPage({ user, room, onLeave }) {
     broadcast('volume', { volume: v });
   };
 
+  // ── Queue management ──────────────────────────────────────────────────────────
+  const broadcastQueueUpdate = (newQueue, newIndex) => {
+    broadcast('queue-update', {
+      queue: newQueue,
+      currentTrack: newQueue[newIndex] || null,
+      currentIndex: newIndex,
+    });
+  };
+
   const addFiles = async () => {
     if (!isHost) return;
     const tracks = await window.electron?.pickFiles();
     if (!tracks?.length) return;
-    const newQueue = [...queue, ...tracks];
+    const newQueue = [...queueRef.current, ...tracks];
+    const newIndex = queueIndexRef.current;
     setQueue(newQueue);
-    broadcast('queue-update', { queue: newQueue, currentTrack: currentTrack });
-    if (newQueue.length === tracks.length) {
-      playTrackAt(0);
+    queueRef.current = newQueue;
+    broadcastQueueUpdate(newQueue, newIndex);
+    if (newQueue.length === tracks.length) playTrackAt(0);
+  };
+
+  const addFolder = async () => {
+    if (!isHost) return;
+    setLoadingFolder(true);
+    try {
+      const tracks = await window.electron?.pickFolder();
+      if (!tracks?.length) return;
+      const newQueue = [...queueRef.current, ...tracks];
+      const newIndex = queueIndexRef.current;
+      setQueue(newQueue);
+      queueRef.current = newQueue;
+      broadcastQueueUpdate(newQueue, newIndex);
+      if (newQueue.length === tracks.length) playTrackAt(0);
+    } finally {
+      setLoadingFolder(false);
     }
   };
 
   const removeTrack = (index) => {
-    const newQueue = queue.filter((_, i) => i !== index);
-    let newIndex = queueIndex;
-    if (index < queueIndex) newIndex--;
-    else if (index === queueIndex) newIndex = Math.min(queueIndex, newQueue.length - 1);
+    const newQueue = queueRef.current.filter((_, i) => i !== index);
+    let newIndex = queueIndexRef.current;
+    if (index < newIndex) newIndex--;
+    else if (index === newIndex) newIndex = Math.min(newIndex, newQueue.length - 1);
+    newIndex = Math.max(0, newIndex);
     setQueue(newQueue);
-    setQueueIndex(Math.max(0, newIndex));
-    broadcast('queue-update', { queue: newQueue, currentTrack: newQueue[newIndex] || null });
+    queueRef.current = newQueue;
+    setQueueIndex(newIndex);
+    queueIndexRef.current = newIndex;
+    broadcastQueueUpdate(newQueue, newIndex);
   };
+
+  const handleShuffle = () => {
+    if (!isHost) { setShuffle(s => !s); return; }
+    const newShuffle = !shuffle;
+    setShuffle(newShuffle);
+    if (newShuffle) {
+      // Shuffle the queue but keep current track at current index
+      const current = queueRef.current[queueIndexRef.current];
+      const rest = queueRef.current.filter((_, i) => i !== queueIndexRef.current);
+      for (let i = rest.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [rest[i], rest[j]] = [rest[j], rest[i]];
+      }
+      const newQueue = [current, ...rest];
+      setQueue(newQueue);
+      queueRef.current = newQueue;
+      setQueueIndex(0);
+      queueIndexRef.current = 0;
+      broadcastQueueUpdate(newQueue, 0);
+    }
+  };
+
+  // ── Drag and drop queue reorder ────────────────────────────────────────────────
+  const handleDragStart = (e, index) => {
+    dragFrom.current = index;
+    e.dataTransfer.effectAllowed = 'move';
+  };
+  const handleDragOver = (e, index) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    setDragOver(index);
+  };
+  const handleDrop = (e, toIndex) => {
+    e.preventDefault();
+    setDragOver(null);
+    if (dragFrom.current === null || dragFrom.current === toIndex) return;
+
+    const newQueue = reorder(queueRef.current, dragFrom.current, toIndex);
+    let newIndex = queueIndexRef.current;
+    if (dragFrom.current === newIndex) {
+      newIndex = toIndex;
+    } else if (dragFrom.current < newIndex && toIndex >= newIndex) {
+      newIndex--;
+    } else if (dragFrom.current > newIndex && toIndex <= newIndex) {
+      newIndex++;
+    }
+    newIndex = Math.max(0, Math.min(newIndex, newQueue.length - 1));
+
+    setQueue(newQueue);
+    queueRef.current = newQueue;
+    setQueueIndex(newIndex);
+    queueIndexRef.current = newIndex;
+    broadcastQueueUpdate(newQueue, newIndex);
+    dragFrom.current = null;
+  };
+  const handleDragEnd = () => { setDragOver(null); dragFrom.current = null; };
 
   const handleLeave = async () => {
     if (isHost) await window.electron?.stopRoom();
     onLeave();
   };
 
-  // Progress bar max
+  const currentTrack = queue[queueIndex] || null;
   const dur = duration || currentTrack?.duration || 1;
 
   return (
     <div style={{ display: 'flex', height: '100%', overflow: 'hidden' }}>
 
-      {/* Left sidebar - members */}
+      {/* ── Left sidebar: members ── */}
       <div style={{
         width: 220, flexShrink: 0,
         background: 'var(--bg2)', borderRight: '1px solid var(--border)',
@@ -267,11 +416,9 @@ export default function RoomPage({ user, room, onLeave }) {
         <div style={{ fontSize: 11, fontFamily: 'var(--mono)', color: 'var(--text3)', letterSpacing: '0.15em', textTransform: 'uppercase', marginBottom: 12 }}>
           ◈ {room.name}
         </div>
-
         <div style={{ fontSize: 12, color: 'var(--text3)', fontWeight: 600, marginBottom: 6 }}>
           LISTENERS · {members.length}
         </div>
-
         {members.map((m, i) => (
           <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '6px 8px', borderRadius: 8 }}>
             <div style={{ position: 'relative' }}>
@@ -282,11 +429,10 @@ export default function RoomPage({ user, room, onLeave }) {
                   display: 'flex', gap: 1.5, alignItems: 'flex-end',
                   background: 'var(--bg2)', borderRadius: 3, padding: '1px 2px',
                 }}>
-                  {[0, 80, 160].map(delay => (
-                    <div key={delay} style={{
+                  {[0, 80, 160].map(d => (
+                    <div key={d} style={{
                       width: 2, height: 6, background: 'var(--green)', borderRadius: 1,
-                      animation: `wave 0.8s ease-in-out infinite`,
-                      animationDelay: `${delay}ms`,
+                      animation: 'wave 0.8s ease-in-out infinite', animationDelay: `${d}ms`,
                     }} />
                   ))}
                 </div>
@@ -306,19 +452,18 @@ export default function RoomPage({ user, room, onLeave }) {
             {connError}
           </div>
         )}
-
         <button className="btn btn-ghost btn-sm" onClick={handleLeave} style={{ width: '100%' }}>
           ← Leave Room
         </button>
       </div>
 
-      {/* Main content */}
+      {/* ── Main content ── */}
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
 
         {/* Top bar */}
         <div style={{
           padding: '12px 24px', borderBottom: '1px solid var(--border)',
-          display: 'flex', alignItems: 'center', gap: 12,
+          display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap',
         }}>
           <div style={{
             width: 8, height: 8, borderRadius: '50%',
@@ -329,11 +474,30 @@ export default function RoomPage({ user, room, onLeave }) {
             {connected ? `Connected · ${isHost ? 'Hosting' : 'Guest'}` : 'Connecting…'}
           </span>
           <div style={{ flex: 1 }} />
+
           {isHost && (
-            <button className="btn btn-surface btn-sm" onClick={addFiles}>
-              + Add Music
-            </button>
+            <>
+              <button className="btn btn-surface btn-sm" onClick={addFiles}>
+                + Files
+              </button>
+              <button className="btn btn-surface btn-sm" onClick={addFolder} disabled={loadingFolder}>
+                {loadingFolder ? '⟳ Scanning…' : '+ Folder'}
+              </button>
+            </>
           )}
+
+          <button
+            className="btn btn-ghost btn-sm"
+            onClick={handleShuffle}
+            title="Shuffle queue"
+            style={{
+              color: shuffle ? 'var(--accent2)' : 'var(--text2)',
+              borderColor: shuffle ? 'var(--accent)' : undefined,
+            }}
+          >
+            ⇄ Shuffle
+          </button>
+
           <button
             className="btn btn-ghost btn-sm"
             onClick={() => setShowQueue(!showQueue)}
@@ -343,24 +507,24 @@ export default function RoomPage({ user, room, onLeave }) {
           </button>
         </div>
 
-        {/* Now playing + queue layout */}
+        {/* Player + queue */}
         <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
 
           {/* Now playing */}
           <div style={{
             flex: 1, display: 'flex', flexDirection: 'column',
             alignItems: 'center', justifyContent: 'center',
-            padding: 40, gap: 32,
+            padding: 40, gap: 28,
           }}>
-            {/* Album art placeholder */}
+            {/* Album art */}
             <div style={{
-              width: 200, height: 200, borderRadius: 20,
+              width: 190, height: 190, borderRadius: 20,
               background: currentTrack
                 ? 'linear-gradient(135deg, var(--accent) 0%, var(--bg3) 100%)'
                 : 'var(--surface)',
               border: '1px solid var(--border)',
               display: 'flex', alignItems: 'center', justifyContent: 'center',
-              fontSize: 64,
+              fontSize: 60,
               boxShadow: isPlaying ? '0 0 60px rgba(124,106,247,0.3)' : 'none',
               transition: 'box-shadow 0.5s ease',
               animation: isPlaying ? 'pulse 2s ease-in-out infinite' : 'none',
@@ -369,23 +533,26 @@ export default function RoomPage({ user, room, onLeave }) {
             </div>
 
             {/* Track info */}
-            <div style={{ textAlign: 'center', maxWidth: 360 }}>
+            <div style={{ textAlign: 'center', maxWidth: 340, width: '100%' }}>
               <div style={{
-                fontSize: 22, fontWeight: 800, marginBottom: 6,
+                fontSize: 20, fontWeight: 800, marginBottom: 4,
                 overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
               }}>
                 {currentTrack?.title || 'No track loaded'}
               </div>
-              <div style={{ color: 'var(--text2)', fontSize: 15 }}>
-                {currentTrack?.artist || (isHost ? 'Add music with "+ Add Music"' : 'Waiting for host…')}
+              <div style={{ color: 'var(--text2)', fontSize: 14 }}>
+                {currentTrack?.artist || (isHost ? 'Add music above' : 'Waiting for host…')}
               </div>
               {currentTrack?.album && (
-                <div style={{ color: 'var(--text3)', fontSize: 13, marginTop: 4 }}>{currentTrack.album}</div>
+                <div style={{ color: 'var(--text3)', fontSize: 12, marginTop: 3 }}>{currentTrack.album}</div>
               )}
+              <div style={{ color: 'var(--text3)', fontSize: 12, fontFamily: 'var(--mono)', marginTop: 6 }}>
+                {queue.length > 0 && `${queueIndex + 1} / ${queue.length}`}
+              </div>
             </div>
 
-            {/* Progress */}
-            <div style={{ width: '100%', maxWidth: 380 }}>
+            {/* Progress bar */}
+            <div style={{ width: '100%', maxWidth: 360 }}>
               <input
                 type="range" min={0} max={dur} step={0.1} value={position}
                 onChange={handleSeek}
@@ -397,7 +564,7 @@ export default function RoomPage({ user, room, onLeave }) {
               </div>
             </div>
 
-            {/* Controls */}
+            {/* Playback controls */}
             <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
               <button className="btn btn-icon" onClick={handlePrev} title="Previous">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
@@ -412,7 +579,7 @@ export default function RoomPage({ user, room, onLeave }) {
                   width: 56, height: 56, borderRadius: '50%',
                   background: 'var(--accent)', border: 'none', cursor: 'pointer',
                   display: 'flex', alignItems: 'center', justifyContent: 'center',
-                  color: '#fff', fontSize: 20,
+                  color: '#fff',
                   boxShadow: '0 0 24px rgba(124,106,247,0.5)',
                   transition: 'all 0.15s', opacity: currentTrack ? 1 : 0.4,
                 }}
@@ -430,58 +597,80 @@ export default function RoomPage({ user, room, onLeave }) {
 
               <button className="btn btn-icon" onClick={handleNext} title="Next">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
-                  <path d="M6 18l8.5-6L6 6v12zm2.5-6 8.5 6V6z"/>
-                  <path d="M16 6h2v12h-2z"/>
+                  <path d="M6 18l8.5-6L6 6v12zM16 6h2v12h-2z"/>
                 </svg>
               </button>
             </div>
 
             {/* Volume */}
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10, width: '100%', maxWidth: 280 }}>
-              <svg width="16" height="16" fill="var(--text3)" viewBox="0 0 24 24">
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, width: '100%', maxWidth: 260 }}>
+              <svg width="14" height="14" fill="var(--text3)" viewBox="0 0 24 24">
                 <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02z"/>
               </svg>
-              <input
-                type="range" min={0} max={1} step={0.01} value={volume}
+              <input type="range" min={0} max={1} step={0.01} value={volume}
                 onChange={handleVolumeChange}
                 style={{ flex: 1, accentColor: 'var(--accent2)' }}
               />
-              <svg width="16" height="16" fill="var(--text3)" viewBox="0 0 24 24">
+              <svg width="14" height="14" fill="var(--text3)" viewBox="0 0 24 24">
                 <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/>
               </svg>
             </div>
           </div>
 
-          {/* Queue panel */}
+          {/* ── Queue panel ── */}
           {showQueue && (
             <div style={{
               width: 320, borderLeft: '1px solid var(--border)',
               background: 'var(--bg2)', display: 'flex', flexDirection: 'column',
               overflow: 'hidden',
             }}>
-              <div style={{ padding: '16px 20px', borderBottom: '1px solid var(--border)', fontWeight: 700, fontSize: 15 }}>
-                Queue · {queue.length} tracks
+              <div style={{
+                padding: '14px 16px', borderBottom: '1px solid var(--border)',
+                fontWeight: 700, fontSize: 14,
+                display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+              }}>
+                <span>Queue · {queue.length}</span>
+                {isHost && (
+                  <span style={{ fontSize: 11, color: 'var(--text3)', fontWeight: 400 }}>
+                    drag to reorder
+                  </span>
+                )}
               </div>
-              <div style={{ flex: 1, overflow: 'auto', padding: 8 }}>
+
+              <div style={{ flex: 1, overflow: 'auto', padding: 6 }}>
                 {queue.length === 0 && (
                   <div style={{ padding: 24, textAlign: 'center', color: 'var(--text3)', fontSize: 14 }}>
-                    {isHost ? 'Add music with "+ Add Music"' : 'No tracks in queue yet'}
+                    {isHost ? 'Add music with "+ Files" or "+ Folder"' : 'No tracks yet'}
                   </div>
                 )}
+
                 {queue.map((track, i) => (
                   <div
-                    key={i}
+                    key={`${track.path}-${i}`}
                     className={`track-item ${i === queueIndex ? 'active' : ''}`}
                     onClick={() => playTrackAt(i)}
+                    draggable={isHost}
+                    onDragStart={isHost ? (e) => handleDragStart(e, i) : undefined}
+                    onDragOver={isHost ? (e) => handleDragOver(e, i) : undefined}
+                    onDrop={isHost ? (e) => handleDrop(e, i) : undefined}
+                    onDragEnd={isHost ? handleDragEnd : undefined}
+                    style={{
+                      outline: dragOver === i ? '2px solid var(--accent)' : 'none',
+                      opacity: dragFrom.current === i ? 0.4 : 1,
+                      cursor: isHost ? 'grab' : 'pointer',
+                    }}
                   >
+                    {/* Index / playing indicator */}
                     <div style={{
-                      width: 32, height: 32, borderRadius: 8, flexShrink: 0,
+                      width: 30, height: 30, borderRadius: 7, flexShrink: 0,
                       background: i === queueIndex ? 'var(--accent)' : 'var(--surface)',
                       display: 'flex', alignItems: 'center', justifyContent: 'center',
-                      fontSize: 12, fontFamily: 'var(--mono)', color: i === queueIndex ? '#fff' : 'var(--text3)',
+                      fontSize: 11, fontFamily: 'var(--mono)',
+                      color: i === queueIndex ? '#fff' : 'var(--text3)',
                     }}>
                       {i === queueIndex && isPlaying ? '♫' : i + 1}
                     </div>
+
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <div className="track-title" style={{
                         fontSize: 13, fontWeight: 600,
@@ -489,21 +678,24 @@ export default function RoomPage({ user, room, onLeave }) {
                       }}>
                         {track.title}
                       </div>
-                      <div style={{ fontSize: 12, color: 'var(--text3)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      <div style={{ fontSize: 11, color: 'var(--text3)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                         {track.artist}
                       </div>
                     </div>
-                    <div style={{ fontSize: 12, fontFamily: 'var(--mono)', color: 'var(--text3)' }}>
+
+                    <div style={{ fontSize: 11, fontFamily: 'var(--mono)', color: 'var(--text3)', flexShrink: 0 }}>
                       {fmt(track.duration)}
                     </div>
+
                     {isHost && (
                       <button
                         onClick={e => { e.stopPropagation(); removeTrack(i); }}
                         style={{
                           background: 'none', border: 'none', color: 'var(--text3)',
-                          cursor: 'pointer', fontSize: 16, padding: '0 2px',
-                          lineHeight: 1,
+                          cursor: 'pointer', fontSize: 16, padding: '0 2px', lineHeight: 1,
+                          flexShrink: 0,
                         }}
+                        title="Remove"
                       >×</button>
                     )}
                   </div>
