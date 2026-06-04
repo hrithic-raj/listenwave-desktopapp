@@ -2,19 +2,16 @@ import React, { useState, useEffect, useCallback } from 'react';
 import Avatar from '../components/Avatar';
 
 export default function LobbyPage({ user, onJoinRoom, onChangeUser }) {
-  const [tab, setTab] = useState('browse'); // browse | create
+  const [tab, setTab] = useState('browse');
   const [rooms, setRooms] = useState([]);
   const [scanning, setScanning] = useState(false);
 
-  // Create room state
   const [roomName, setRoomName] = useState('');
   const [password, setPassword] = useState('');
   const [creating, setCreating] = useState(false);
 
-  // Join state
   const [joinTarget, setJoinTarget] = useState(null);
   const [joinPassword, setJoinPassword] = useState('');
-  const [joinError, setJoinError] = useState('');
   const [manualHost, setManualHost] = useState('');
   const [manualPort, setManualPort] = useState('45678');
   const [showManual, setShowManual] = useState(false);
@@ -34,6 +31,14 @@ export default function LobbyPage({ user, onJoinRoom, onChangeUser }) {
   useEffect(() => {
     if (tab === 'browse') scan();
   }, [tab, scan]);
+
+  // A user is the host if they are connecting to their own machine.
+  // We detect this by comparing the target host to the local IP and loopback addresses.
+  const detectIsHost = async (targetHost) => {
+    const localIp = await window.electron?.getLocalIp();
+    const loopbacks = ['127.0.0.1', 'localhost', '::1'];
+    return targetHost === localIp || loopbacks.includes(targetHost);
+  };
 
   const createRoom = async () => {
     if (!roomName.trim() || !password.trim()) return;
@@ -60,24 +65,25 @@ export default function LobbyPage({ user, onJoinRoom, onChangeUser }) {
   };
 
   const attemptJoin = async (room) => {
-    setJoinError('');
+    const isHost = await detectIsHost(room.host);
     onJoinRoom({
       name: room.name,
       host: room.host,
       port: room.port,
       password: joinPassword,
-      isHost: false,
+      isHost,
     });
   };
 
-  const attemptManualJoin = () => {
+  const attemptManualJoin = async () => {
     if (!manualHost.trim()) return;
+    const isHost = await detectIsHost(manualHost.trim());
     onJoinRoom({
       name: 'Room',
       host: manualHost.trim(),
       port: parseInt(manualPort) || 45678,
       password: joinPassword,
-      isHost: false,
+      isHost,
     });
   };
 
@@ -249,10 +255,9 @@ export default function LobbyPage({ user, onJoinRoom, onChangeUser }) {
 
               <div style={{
                 background: 'var(--surface)', border: '1px solid var(--border)',
-                borderRadius: 12, padding: 14, fontSize: 13, color: 'var(--text2)',
-                lineHeight: 1.6,
+                borderRadius: 12, padding: 14, fontSize: 13, color: 'var(--text2)', lineHeight: 1.6,
               }}>
-                💡 As host, you can load local music files (MP3, FLAC, WAV, OGG) and everyone in the room will hear them in sync through your machine. Guests just need to connect.
+                💡 As host, you can load local music files (MP3, FLAC, WAV, OGG) and everyone in the room will hear them in sync. If you leave and rejoin your own room, you'll automatically get host privileges back.
               </div>
 
               <button

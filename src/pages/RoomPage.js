@@ -341,11 +341,9 @@ export default function RoomPage({ user, room, onLeave }) {
   };
 
   const handleShuffle = () => {
-    if (!isHost) { setShuffle(s => !s); return; }
     const newShuffle = !shuffle;
     setShuffle(newShuffle);
     if (newShuffle) {
-      // Shuffle the queue but keep current track at current index
       const current = queueRef.current[queueIndexRef.current];
       const rest = queueRef.current.filter((_, i) => i !== queueIndexRef.current);
       for (let i = rest.length - 1; i > 0; i--) {
@@ -630,11 +628,9 @@ export default function RoomPage({ user, room, onLeave }) {
                 display: 'flex', alignItems: 'center', justifyContent: 'space-between',
               }}>
                 <span>Queue · {queue.length}</span>
-                {isHost && (
-                  <span style={{ fontSize: 11, color: 'var(--text3)', fontWeight: 400 }}>
-                    drag to reorder
-                  </span>
-                )}
+                <span style={{ fontSize: 11, color: 'var(--text3)', fontWeight: 400 }}>
+                  drag to reorder
+                </span>
               </div>
 
               <div style={{ flex: 1, overflow: 'auto', padding: 6 }}>
@@ -649,15 +645,15 @@ export default function RoomPage({ user, room, onLeave }) {
                     key={`${track.path}-${i}`}
                     className={`track-item ${i === queueIndex ? 'active' : ''}`}
                     onClick={() => playTrackAt(i)}
-                    draggable={isHost}
-                    onDragStart={isHost ? (e) => handleDragStart(e, i) : undefined}
-                    onDragOver={isHost ? (e) => handleDragOver(e, i) : undefined}
-                    onDrop={isHost ? (e) => handleDrop(e, i) : undefined}
-                    onDragEnd={isHost ? handleDragEnd : undefined}
+                    draggable={true}
+                    onDragStart={(e) => handleDragStart(e, i)}
+                    onDragOver={(e) => handleDragOver(e, i)}
+                    onDrop={(e) => handleDrop(e, i)}
+                    onDragEnd={handleDragEnd}
                     style={{
                       outline: dragOver === i ? '2px solid var(--accent)' : 'none',
                       opacity: dragFrom.current === i ? 0.4 : 1,
-                      cursor: isHost ? 'grab' : 'pointer',
+                      cursor: 'grab',
                     }}
                   >
                     {/* Index / playing indicator */}
