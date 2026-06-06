@@ -165,6 +165,11 @@ function startHostServer(roomName, password, hostName) {
     socket.on('volume', ({ volume }) => {
       socket.broadcast.to('room').emit('volume', { volume });
     });
+
+    // Chat — broadcast to everyone including sender so all see it instantly
+    socket.on('chat', ({ name, text, ts }) => {
+      io.to('room').emit('chat', { name, text, ts });
+    });
   });
 
   httpServer.listen(PORT, '0.0.0.0', () => {
