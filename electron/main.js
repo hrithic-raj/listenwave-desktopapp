@@ -139,6 +139,7 @@ function startHostServer(roomName, password, hostName) {
       socket.emit('joined', {
         roomState: {
           ...roomState,
+          ytAvailable: !!getYtdlpBin(),
           position: roomState.isPlaying
             ? roomState.position + (Date.now() - roomState.positionTimestamp) / 1000
             : roomState.position,

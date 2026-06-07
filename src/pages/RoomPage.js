@@ -271,9 +271,9 @@ export default function RoomPage({ user, room, onLeave }) {
   }, []);
 
   // Check yt-dlp on mount
-  useEffect(() => {
-    window.electron?.checkYtdlp().then(r => setYtAvailable(r?.available || false));
-  }, []);
+  // useEffect(() => {
+  //   window.electron?.checkYtdlp().then(r => setYtAvailable(r?.available || false));
+  // }, []);
 
   // ── Audio ──────────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -335,6 +335,7 @@ export default function RoomPage({ user, room, onLeave }) {
 
     socket.on('joined', ({ roomState }) => {
       const q = (roomState.queue || []).filter(t => t && t.type);
+      setYtAvailable(roomState.ytAvailable);
       setQueue(q); queueRef.current = q;
       setMembers(roomState.members || []);
       let idx = 0;
