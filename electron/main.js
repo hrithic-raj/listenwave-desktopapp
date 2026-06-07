@@ -94,19 +94,34 @@ function startHostServer(roomName, password, hostName) {
 
   // ── YouTube audio stream ──────────────────────────────────────────────────
   expressApp.get('/ytstream', (req, res) => {
+    // console.log("Headers:", req.headers);
+    
     const ytUrl = req.query.url;
     if (!ytUrl) return res.status(400).send('No URL');
     const bin = getYtdlpBin();
     if (!bin) return res.status(500).send('yt-dlp not installed');
+    
+    // res.setHeader('Content-Type', 'audio/mpeg');
 
-    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Content-Type', 'audio/webm');
+
     res.setHeader('Transfer-Encoding', 'chunked');
+    
+    // const args = [
+    //   '--no-playlist', '-f', 'bestaudio[ext=m4a]/bestaudio/best',
+    //   '--audio-format', 'mp3', '-o', '-', '--quiet', ytUrl,
+    // ];
 
     const args = [
-      '--no-playlist', '-f', 'bestaudio[ext=m4a]/bestaudio/best',
-      '--audio-format', 'mp3', '-o', '-', '--quiet', ytUrl,
+      '--no-playlist',
+      '-f',
+      '18',
+      '-o',
+      '-',
+      '--quiet',
+      ytUrl,
     ];
-
+    
     const proc = spawn(bin, args);
     proc.stdout.pipe(res);
     proc.stderr.on('data', d => console.error('[yt-dlp]', d.toString()));
