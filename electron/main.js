@@ -129,6 +129,45 @@ function startHostServer(roomName, password, hostName) {
     req.on('close', () => { try { proc.kill('SIGKILL'); } catch {} });
   });
 
+  // ── YouTube: resolve direct CDN URL (with CORS + correct newline split) ────
+  expressApp.get('/ytresolve', (req, res) => {
+    // CORS — allow fetch() from localhost:3000 (dev) and any LAN origin
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET');
+
+    const ytUrl = req.query.url;
+    if (!ytUrl) return res.status(400).json({ error: 'No URL' });
+    const bin = getYtdlpBin();
+    if (!bin) return res.status(500).json({ error: 'yt-dlp not installed' });
+
+    console.log('[ytresolve] resolving:', ytUrl.slice(0, 60));
+
+    const proc = spawn(bin, [
+      '--no-playlist', '-f', '18/bestaudio/best', '-g', '--quiet', ytUrl,
+    ]);
+
+    let out = '', err = '';
+    proc.stdout.on('data', d => { out += d.toString(); });
+    proc.stderr.on('data', d => { err += d.toString(); });
+    proc.on('close', code => {
+      console.log('[ytresolve] exit code:', code);
+      if (err) console.log('[ytresolve] stderr:', err.trim().slice(0, 200));
+      if (code !== 0 || !out.trim()) {
+        return res.status(500).json({ error: err || 'no URL returned' });
+      }
+      // yt-dlp -g returns one URL per line; last line is the audio stream
+      const lines = out.trim().split('\n').filter(l => l.trim());
+      const streamUrl = lines[lines.length - 1].trim();
+      console.log('[ytresolve] got URL, starts:', streamUrl.slice(0, 60));
+      res.json({ streamUrl });
+    });
+    proc.on('error', e => {
+      console.error('[ytresolve] spawn error:', e);
+      res.status(500).json({ error: e.message });
+    });
+    req.on('close', () => { try { proc.kill(); } catch {} });
+  });
+
   // ── Socket events ─────────────────────────────────────────────────────────
   io.on('connection', (socket) => {
     socket.on('join', ({ name, password: pw }) => {
@@ -196,59 +235,51 @@ function startHostServer(roomName, password, hostName) {
 
     socket.on('chat', ({ name, text, ts }) => { io.to('room').emit('chat', { name, text, ts }); });
 
-    // Any member can request a YouTube search — host machine runs yt-dlp
-    socket.on('yt-search', async ({ query, requestId }) => {
+    // Any member can request a YouTube search — uses spawn so UI never freezes
+    socket.on('yt-search', ({ query, requestId }) => {
       const bin = getYtdlpBin();
       if (!bin) { socket.emit('yt-search-result', { requestId, error: 'yt-dlp not installed on host' }); return; }
-      try {
-        const raw = execSync(
-          `${bin} "ytsearch8:${query.replace(/"/g, '')}" --dump-json --no-download --flat-playlist --quiet`,
-          { timeout: 15000, maxBuffer: 1024 * 1024 * 4 }
-        ).toString();
-        const results = raw.trim().split('\n').map(line => {
+      console.log('[yt-search] query:', query);
+      const safeQuery = query.replace(/"/g, '').replace(/'/g, '');
+      const proc = spawn(bin, [`ytsearch8:${safeQuery}`, '--dump-json', '--no-download', '--flat-playlist', '--quiet']);
+      let out = '', err = '';
+      proc.stdout.on('data', d => { out += d.toString(); });
+      proc.stderr.on('data', d => { err += d.toString(); });
+      proc.on('close', code => {
+        console.log('[yt-search] exit code:', code, 'lines:', out.trim().split('\n').length);
+        if (code !== 0 && !out.trim()) { socket.emit('yt-search-result', { requestId, error: err || 'Search failed' }); return; }
+        const results = out.trim().split('\n').map(line => {
           try {
             const d = JSON.parse(line);
-            return {
-              ytId: d.id,
-              ytUrl: `https://www.youtube.com/watch?v=${d.id}`,
-              title: d.title || 'Unknown',
-              artist: d.uploader || d.channel || 'YouTube',
-              duration: d.duration || 0,
-              thumbnail: d.thumbnail || `https://i.ytimg.com/vi/${d.id}/hqdefault.jpg`,
-            };
+            return { ytId: d.id, ytUrl: `https://www.youtube.com/watch?v=${d.id}`, title: d.title || 'Unknown', artist: d.uploader || d.channel || 'YouTube', duration: d.duration || 0, thumbnail: d.thumbnail || `https://i.ytimg.com/vi/${d.id}/hqdefault.jpg` };
           } catch { return null; }
         }).filter(Boolean);
+        console.log('[yt-search] returning', results.length, 'results');
         socket.emit('yt-search-result', { requestId, results });
-      } catch (e) {
-        socket.emit('yt-search-result', { requestId, error: e.message });
-      }
+      });
+      proc.on('error', e => { console.error('[yt-search] spawn error:', e); socket.emit('yt-search-result', { requestId, error: e.message }); });
     });
 
-    // Resolve a YouTube URL to track metadata
-    socket.on('yt-resolve', async ({ url, requestId }) => {
+    // Resolve a YouTube URL to track metadata — uses spawn so UI never freezes
+    socket.on('yt-resolve', ({ url, requestId }) => {
       const bin = getYtdlpBin();
       if (!bin) { socket.emit('yt-resolve-result', { requestId, error: 'yt-dlp not installed on host' }); return; }
-      try {
-        const raw = execSync(
-          `${bin} "${url}" --dump-json --no-download --quiet`,
-          { timeout: 15000, maxBuffer: 1024 * 1024 * 2 }
-        ).toString().trim().split('\n')[0];
-        const d = JSON.parse(raw);
-        socket.emit('yt-resolve-result', {
-          requestId,
-          track: {
-            type: 'youtube',
-            ytId: d.id,
-            ytUrl: `https://www.youtube.com/watch?v=${d.id}`,
-            title: d.title || 'Unknown',
-            artist: d.uploader || d.channel || 'YouTube',
-            duration: d.duration || 0,
-            thumbnail: d.thumbnail || `https://i.ytimg.com/vi/${d.id}/hqdefault.jpg`,
-          },
-        });
-      } catch (e) {
-        socket.emit('yt-resolve-result', { requestId, error: 'Could not resolve URL' });
-      }
+      console.log('[yt-resolve] url:', url);
+      const proc = spawn(bin, [url, '--dump-json', '--no-download', '--quiet']);
+      let out = '', err = '';
+      proc.stdout.on('data', d => { out += d.toString(); });
+      proc.stderr.on('data', d => { err += d.toString(); });
+      proc.on('close', code => {
+        console.log('[yt-resolve] exit code:', code);
+        try {
+          const d = JSON.parse(out.trim().split('\n')[0]);
+          socket.emit('yt-resolve-result', { requestId, track: { type: 'youtube', ytId: d.id, ytUrl: `https://www.youtube.com/watch?v=${d.id}`, title: d.title || 'Unknown', artist: d.uploader || d.channel || 'YouTube', duration: d.duration || 0, thumbnail: d.thumbnail || `https://i.ytimg.com/vi/${d.id}/hqdefault.jpg` } });
+        } catch (e) {
+          console.error('[yt-resolve] error:', e.message);
+          socket.emit('yt-resolve-result', { requestId, error: 'Could not resolve URL' });
+        }
+      });
+      proc.on('error', e => { socket.emit('yt-resolve-result', { requestId, error: e.message }); });
     });
   });
 

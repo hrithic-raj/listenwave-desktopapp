@@ -295,9 +295,46 @@ export default function RoomPage({ user, room, onLeave }) {
 
   useEffect(() => { audioRef.current.volume = volume; }, [volume]);
 
+  // Two-level cache:
+  //   ytUrlCache: ytId → resolved direct URL string (ready to use)
+  //   ytFetchCache: ytId → in-flight Promise (so 3 callers share 1 request)
+  const ytUrlCache = useRef({});
+  const ytFetchCache = useRef({});
+
+  // Returns a Promise<string|null> for the direct URL.
+  // Multiple callers get the same promise — only one fetch fires.
+  const getDirectUrl = useCallback((track) => {
+    if (!track || track.type !== 'youtube') return Promise.resolve(null);
+    if (ytUrlCache.current[track.ytId]) {
+      return Promise.resolve(ytUrlCache.current[track.ytId]);
+    }
+    if (ytFetchCache.current[track.ytId]) {
+      return ytFetchCache.current[track.ytId]; // reuse in-flight
+    }
+    console.log('[getDirectUrl] fetching for:', track.title);
+    const promise = fetch(`${serverUrl}/ytresolve?url=${encodeURIComponent(track.ytUrl)}`)
+      .then(r => r.json())
+      .then(data => {
+        if (data.streamUrl) {
+          console.log('[getDirectUrl] cached:', track.title);
+          ytUrlCache.current[track.ytId] = data.streamUrl;
+          delete ytFetchCache.current[track.ytId];
+          return data.streamUrl;
+        }
+        return null;
+      })
+      .catch(e => { console.warn('[getDirectUrl] failed:', e); return null; });
+    ytFetchCache.current[track.ytId] = promise;
+    return promise;
+  }, [serverUrl]);
+
   const getAudioUrl = useCallback((track) => {
     if (!track) return '';
-    if (track.type === 'youtube' && track.ytUrl) return `${serverUrl}/ytstream?url=${encodeURIComponent(track.ytUrl)}`;
+    if (track.type === 'youtube') {
+      const cached = ytUrlCache.current[track.ytId];
+      if (cached) return cached;
+      return `${serverUrl}/ytstream?url=${encodeURIComponent(track.ytUrl)}`;
+    }
     return `${serverUrl}/audio?path=${encodeURIComponent(track.path)}`;
   }, [serverUrl]);
 
@@ -309,7 +346,9 @@ export default function RoomPage({ user, room, onLeave }) {
     audio.currentTime = pos || 0;
     setDuration(track.duration || 0);
     audio.play().then(() => setIsPlaying(true)).catch(() => setIsPlaying(false));
-  }, [getAudioUrl]);
+    // Kick off prefetch immediately — shared promise so no duplicate requests
+    getDirectUrl(track);
+  }, [getAudioUrl, getDirectUrl]);
 
   const advanceTrack = useCallback(() => {
     const q = queueRef.current;
@@ -405,9 +444,39 @@ export default function RoomPage({ user, room, onLeave }) {
     const track = queueRef.current[queueIndexRef.current];
     if (!track) return;
     const pos = audioRef.current.currentTime;
-    loadAndPlay(track, pos);
+    const audio = audioRef.current;
+
+    if (track.type === 'youtube') {
+      // Always ensure we have the direct URL before playing/resuming.
+      // getDirectUrl returns immediately if already cached, or awaits the
+      // in-flight promise — so first-time pause works without a double-restart.
+      getDirectUrl(track).then(directUrl => {
+        if (directUrl && audio.src !== directUrl) {
+          console.log('[handlePlay] switching to direct URL at', pos);
+          audio.src = directUrl;
+          audio.load();
+          audio.addEventListener('canplay', function onCp() {
+            audio.removeEventListener('canplay', onCp);
+            audio.currentTime = pos;
+            audio.play().then(() => setIsPlaying(true)).catch(() => {});
+          });
+        } else {
+          // Already on direct URL or cache hit — just resume
+          console.log('[handlePlay] resuming YT at', pos);
+          audio.currentTime = pos;
+          audio.play().then(() => setIsPlaying(true)).catch(() => loadAndPlay(track, pos));
+        }
+      });
+    } else {
+      // Local file — just resume or load fresh
+      if (audio.src && audio.readyState >= 2) {
+        console.log('[handlePlay] resuming local at', pos);
+        audio.play().then(() => setIsPlaying(true)).catch(() => loadAndPlay(track, pos));
+      } else {
+        loadAndPlay(track, pos);
+      }
+    }
     broadcast('play', { track, position: pos });
-    setIsPlaying(true);
   };
   const handlePause = () => {
     const pos = audioRef.current.currentTime;
@@ -416,7 +485,46 @@ export default function RoomPage({ user, room, onLeave }) {
   };
   const handleSeek = (e) => {
     const pos = parseFloat(e.target.value);
-    audioRef.current.currentTime = pos; setPosition(pos);
+    const audio = audioRef.current;
+    const track = queueRef.current[queueIndexRef.current];
+    console.log('[handleSeek] pos:', pos, 'type:', track?.type, 'readyState:', audio.readyState);
+
+    if (track?.type === 'youtube') {
+      const directUrl = ytUrlCache.current[track.ytId];
+      if (directUrl) {
+        console.log('[handleSeek] using direct URL');
+        if (audio.src !== directUrl) {
+          audio.src = directUrl;
+          audio.load();
+          audio.addEventListener('canplay', function onCp() {
+            audio.removeEventListener('canplay', onCp);
+            audio.currentTime = pos;
+            audio.play().then(() => setIsPlaying(true)).catch(() => {});
+          });
+        } else {
+          audio.currentTime = pos;
+        }
+      } else {
+        // Not cached yet — use shared promise (won't fire a second request)
+        console.log('[handleSeek] waiting for direct URL...');
+        getDirectUrl(track).then(directUrl => {
+          if (directUrl) {
+            audio.src = directUrl;
+            audio.load();
+            audio.addEventListener('canplay', function onCp() {
+              audio.removeEventListener('canplay', onCp);
+              audio.currentTime = pos;
+              audio.play().then(() => setIsPlaying(true)).catch(() => {});
+            });
+          } else {
+            audio.currentTime = pos;
+          }
+        });
+      }
+    } else {
+      audio.currentTime = pos;
+    }
+    setPosition(pos);
     broadcast('seek', { position: pos });
   };
   const handleNext = () => {
